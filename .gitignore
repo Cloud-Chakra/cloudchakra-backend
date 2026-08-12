@@ -1,0 +1,74 @@
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependency directories
+node_modules/
+jspm_packages/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Build / dist
+dist/
+build/
+out/
+target/
+*.egg-info/
+.eggs/
+
+# Databases / runtime files
+*.sqlite3
+*.db
+*.pid
+*.seed
+*.lock
+
+# Caches
+.cache/
+.next/
+.nuxt/
+coverage/
+.nyc_output/
+.mypy_cache/
+.pytest_cache/
+.pyre/
+.hypothesis/
+
+# IDEs / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+*.tar
+*.pid
+*.sock
+docker-compose.override.yml
+
+# Other
+tmp/
+temp/
