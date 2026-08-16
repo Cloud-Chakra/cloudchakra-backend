@@ -195,24 +195,32 @@ const storageService = {
     const doc = await Document.findOne({ docId });
     if (!doc) throw new Error('Document not found');
 
-    if (webSocketManager.isOnline(doc.mainDeviceId)) {
+    // Helper to attempt retrieval from a device
+    const tryDevice = async (deviceId) => {
+      if (!webSocketManager.isOnline(deviceId)) return null;
       try {
-        const result = await webSocketManager.sendRequest(doc.mainDeviceId, 'RETRIEVE_DOC', { docId });
-        return JSON.parse(result.data);
-      } catch (err) {
-        console.warn(`Failed to retrieve from main device ${doc.mainDeviceId}: ${err.message}`);
-      }
-    }
-
-    for (const deviceId of doc.backupDevicesIds) {
-      if (webSocketManager.isOnline(deviceId)) {
-        try {
-          const result = await webSocketManager.sendRequest(deviceId, 'RETRIEVE_DOC', { docId });
-          return JSON.parse(result.data);
-        } catch (err) {
-          console.warn(`Failed to retrieve from backup device ${deviceId}: ${err.message}`);
+        const result = await webSocketManager.sendRequest(deviceId, 'RETRIEVE_DOC', { docId });
+        const data = result.data;
+        // Validate that data is a non-empty string and not "undefined"
+        if (typeof data !== 'string' || data.length === 0 || data === 'undefined') {
+          console.warn(`Invalid data received from device ${deviceId} for doc ${docId}`);
+          return null;
         }
+        return JSON.parse(data);
+      } catch (err) {
+        console.warn(`Failed to retrieve from device ${deviceId}: ${err.message}`);
+        return null;
       }
+    };
+
+    // Try main first
+    const mainData = await tryDevice(doc.mainDeviceId);
+    if (mainData !== null) return mainData;
+
+    // Try backups in order
+    for (const deviceId of doc.backupDevicesIds) {
+      const data = await tryDevice(deviceId);
+      if (data !== null) return data;
     }
 
     throw new Error('No online copy available for this document');
@@ -251,12 +259,8 @@ const storageService = {
 
   /**
    * Ensure a document has at least 3 online copies.
-   * - Promotes a backup to main if main is offline.
-   * - Prunes offline backups from backupDevicesIds.
-   * - Replicates to new devices if needed.
    */
   async ensureReplication(doc) {
-    // Prevent concurrent replication for the same doc
     if (replicatingDocs.has(doc.docId)) {
       console.log(`Replication already in progress for doc ${doc.docId}, skipping.`);
       return;
@@ -264,18 +268,17 @@ const storageService = {
     replicatingDocs.add(doc.docId);
 
     try {
-      // 1. Ensure backupDevicesIds is an array
       if (!Array.isArray(doc.backupDevicesIds)) {
         doc.backupDevicesIds = [];
       }
 
-      // 2. Prune offline backups
+      // Prune offline backups
       const onlineBackups = doc.backupDevicesIds.filter(id => webSocketManager.isOnline(id));
       if (onlineBackups.length !== doc.backupDevicesIds.length) {
         doc.backupDevicesIds = onlineBackups;
       }
 
-      // 3. If main is offline, promote the first online backup (if any) to main
+      // Promote backup if main is offline
       if (!webSocketManager.isOnline(doc.mainDeviceId)) {
         if (onlineBackups.length > 0) {
           const newMain = onlineBackups[0];
@@ -283,20 +286,16 @@ const storageService = {
           doc.mainDeviceId = newMain;
           console.log(`Promoted backup ${newMain} to main for doc ${doc.docId}`);
         } else {
-          // Main is offline and no backups online, keep main as is (still offline)
-          // but ensure it's not undefined
           if (!doc.mainDeviceId) {
             console.error(`Doc ${doc.docId} has no mainDeviceId and no online backups. Cannot promote.`);
-            return; // Do not save
+            return;
           }
         }
       }
 
-      // 4. Determine current online copies after promotion/pruning
       const allCopyDevices = [doc.mainDeviceId, ...doc.backupDevicesIds];
       const onlineCopyDevices = allCopyDevices.filter(id => webSocketManager.isOnline(id));
 
-      // 5. If already have 3 online copies, mark complete and return
       if (onlineCopyDevices.length >= 3) {
         if (doc.replicationStatus !== 'complete') {
           doc.replicationStatus = 'complete';
@@ -305,19 +304,16 @@ const storageService = {
         return;
       }
 
-      // 6. Calculate how many additional copies we need
       const needed = 3 - onlineCopyDevices.length;
       const onlinePhones = webSocketManager.getOnlinePhones();
       const candidates = onlinePhones.filter(id => !allCopyDevices.includes(id));
 
-      // If no candidates, we cannot complete replication now
       if (candidates.length === 0) {
         console.log(`No candidates to replicate doc ${doc.docId}. Remaining pending.`);
-        await doc.save(); // persist any pruning/promotion changes
+        await doc.save();
         return;
       }
 
-      // 7. Need source data from an existing online copy
       if (onlineCopyDevices.length === 0) {
         console.warn(`Cannot replicate doc ${doc.docId}: no online copy available to source data`);
         await doc.save();
@@ -329,7 +325,7 @@ const storageService = {
       try {
         const result = await webSocketManager.sendRequest(sourceDeviceId, 'RETRIEVE_DOC', { docId: doc.docId });
         dataStr = result.data;
-        if (typeof dataStr !== 'string' || dataStr.length === 0) {
+        if (typeof dataStr !== 'string' || dataStr.length === 0 || dataStr === 'undefined') {
           throw new Error(`Invalid data received from source device ${sourceDeviceId}`);
         }
       } catch (err) {
@@ -338,7 +334,6 @@ const storageService = {
         return;
       }
 
-      // 8. Replicate to up to `needed` new devices
       const devicesToAdd = candidates.slice(0, needed);
       for (const newDeviceId of devicesToAdd) {
         try {
@@ -353,7 +348,6 @@ const storageService = {
         }
       }
 
-      // 9. Re-evaluate online copies and update status
       const updatedOnlineCopies = [doc.mainDeviceId, ...doc.backupDevicesIds]
         .filter(id => webSocketManager.isOnline(id)).length;
       doc.replicationStatus = updatedOnlineCopies >= 3 ? 'complete' : 'pending';
@@ -363,10 +357,6 @@ const storageService = {
     }
   },
 
-  /**
-   * Periodic sweep to heal under-replicated documents.
-   * Only processes documents that are marked pending or have fewer than 2 backups.
-   */
   async replicationSweep() {
     const docs = await Document.find({
       $or: [
@@ -383,7 +373,6 @@ const storageService = {
   }
 };
 
-// Instantiate WebSocketManager and start background tasks
 const webSocketManager = new WebSocketManager();
 webSocketManager.startHeartbeat(30000);
 webSocketManager.startReplicationSweep(60000);
