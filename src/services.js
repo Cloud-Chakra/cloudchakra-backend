@@ -205,20 +205,39 @@ const storageService = {
     const deviceIds = doc.deviceIds || [];
     if (deviceIds.length === 0) throw new Error('No devices recorded for this document');
 
-    // Shuffle to pick a random device
-    const shuffled = [...deviceIds].sort(() => Math.random() - 0.5);
-
-    for (const deviceId of shuffled) {
-      if (!webSocketManager.isOnline(deviceId)) continue;
-
+    const tryDevice = async (deviceId) => {
+      if (!webSocketManager.isOnline(deviceId)) return null;
       try {
         const result = await webSocketManager.sendRequest(deviceId, 'RETRIEVE_DOC', { docId });
         const data = result.data;
         if (typeof data === 'string' && data.length > 0 && data !== 'undefined') {
           return JSON.parse(data);
         }
+        return null;
       } catch (err) {
         console.warn(`Failed to retrieve from device ${deviceId}: ${err.message}`);
+        return null;
+      }
+    };
+
+    // First immediate attempt
+    const shuffled = [...deviceIds].sort(() => Math.random() - 0.5);
+    for (const deviceId of shuffled) {
+      const data = await tryDevice(deviceId);
+      if (data !== null) return data;
+    }
+
+    // Retry up to 3 times with 2 seconds delay
+    for (let attempt = 0; attempt < 3; attempt++) {
+      console.log(`Retry ${attempt + 1} for doc ${docId}...`);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      const freshDoc = await Document.findOne({ docId });
+      if (!freshDoc) break;
+
+      for (const deviceId of freshDoc.deviceIds || []) {
+        const data = await tryDevice(deviceId);
+        if (data !== null) return data;
       }
     }
 
