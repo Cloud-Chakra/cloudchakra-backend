@@ -210,9 +210,27 @@ const storageService = {
       try {
         const result = await webSocketManager.sendRequest(deviceId, 'RETRIEVE_DOC', { docId });
         const data = result.data;
-        if (typeof data === 'string' && data.length > 0 && data !== 'undefined') {
-          return JSON.parse(data);
+        
+        // Handle both string and object responses from mobile
+        if (data === null || data === undefined || data === 'undefined') {
+          return null;
         }
+        
+        // If data is already an object, return it directly
+        if (typeof data === 'object') {
+          return data;
+        }
+        
+        // If data is a string, parse it
+        if (typeof data === 'string' && data.length > 0) {
+          try {
+            return JSON.parse(data);
+          } catch (parseErr) {
+            console.warn(`Failed to parse data from device ${deviceId}: ${parseErr.message}`);
+            return null;
+          }
+        }
+        
         return null;
       } catch (err) {
         console.warn(`Failed to retrieve from device ${deviceId}: ${err.message}`);
@@ -317,9 +335,20 @@ const storageService = {
       let dataStr;
       try {
         const result = await webSocketManager.sendRequest(sourceDevice, 'RETRIEVE_DOC', { docId: doc.docId });
-        dataStr = result.data;
-        if (typeof dataStr !== 'string' || dataStr.length === 0 || dataStr === 'undefined') {
-          throw new Error('Invalid data from source');
+        const data = result.data;
+        
+        // Handle both string and object responses
+        if (data === null || data === undefined || data === 'undefined') {
+          throw new Error('Invalid data from source: null or undefined');
+        }
+        
+        // If data is an object, stringify it
+        if (typeof data === 'object') {
+          dataStr = JSON.stringify(data);
+        } else if (typeof data === 'string' && data.length > 0) {
+          dataStr = data;
+        } else {
+          throw new Error('Invalid data from source: unsupported type');
         }
       } catch (err) {
         console.error(`Failed to retrieve from source for replication: ${err.message}`);
