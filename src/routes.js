@@ -17,11 +17,13 @@ router.post('/add/phone', requireApiKey, async (req, res) => {
   try {
     const { deviceId } = req.body;
     if (!deviceId) return res.status(400).json({ error: 'deviceId is required' });
+
     const phone = await Phone.findOneAndUpdate(
       { deviceId },
       { deviceId, status: 'offline' },
       { upsert: true, new: true }
     );
+
     res.json({ success: true, phone });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -29,35 +31,59 @@ router.post('/add/phone', requireApiKey, async (req, res) => {
 });
 
 router.post('/api/store', requireApiKey, async (req, res) => {
+  const start = Date.now();
+
   try {
     const jsonData = req.body;
     if (!jsonData || typeof jsonData !== 'object') {
       return res.status(400).json({ error: 'Request body must be a JSON object' });
     }
+
     const size = Buffer.byteLength(JSON.stringify(jsonData));
     if (size > config.maxDataSize) {
       return res.status(413).json({ error: 'Payload too large' });
     }
+
     const docId = await storageService.storeData(jsonData);
-    res.status(201).json({ success: true, docId });
+    const latencyMs = Date.now() - start;
+
+    res.status(201).json({
+      success: true,
+      docId,
+      latencyMs
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      error: err.message,
+      latencyMs: Date.now() - start
+    });
   }
 });
 
 router.get('/api/retrieve/:docId', requireApiKey, async (req, res) => {
+  const start = Date.now();
+
   try {
     const { docId } = req.params;
     const data = await storageService.retrieveData(docId);
-    res.json({ success: true, data });
+    const latencyMs = Date.now() - start;
+
+    res.json({
+      success: true,
+      data,
+      latencyMs
+    });
   } catch (err) {
-    res.status(404).json({ error: err.message });
+    res.status(404).json({
+      error: err.message,
+      latencyMs: Date.now() - start
+    });
   }
 });
 
 router.get('/api/docs', requireApiKey, async (req, res) => {
   try {
-    const docs = await Document.find({}, 'docId createdAt originalSize encryptedSize shards');
+    const docs = await Document.find({}, 'docId createdAt originalSize shards');
     res.json({ success: true, documents: docs });
   } catch (err) {
     res.status(500).json({ error: err.message });
