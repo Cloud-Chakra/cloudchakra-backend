@@ -12,8 +12,8 @@ const documentSchema = new mongoose.Schema({
   docId: { type: String, unique: true, default: uuidv4, index: true },
   createdAt: { type: Date, default: Date.now },
   mainDeviceId: { type: String, required: true },
-  backupDevicesIds: [{ type: String }],
-  replicationStatus: { type: String, enum: ['pending', 'complete'], default: 'pending' } // NEW
+  backupDevicesIds: { type: [{ type: String }], default: [] },
+  replicationStatus: { type: String, enum: ['pending', 'complete'], default: 'pending' }
 });
 
 const Phone = mongoose.model('Phone', phoneSchema);
