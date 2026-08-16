@@ -40,38 +40,54 @@ wss.on('connection', (ws, req) => {
   ws.on('message', async (data) => {
     try {
       const message = JSON.parse(data.toString());
+
       if (!authenticated && message.type === 'AUTHENTICATE') {
         const { token, deviceId: incomingDeviceId } = message;
+
+        // Validate token
         if (token !== config.phoneToken) {
           ws.send(JSON.stringify({ type: 'AUTH_FAILED', error: 'Invalid token' }));
           ws.close();
           return;
         }
+
+        // Validate deviceId
+        if (!incomingDeviceId || typeof incomingDeviceId !== 'string' || incomingDeviceId.trim() === '') {
+          ws.send(JSON.stringify({ type: 'AUTH_FAILED', error: 'Invalid deviceId' }));
+          ws.close();
+          return;
+        }
+
         const phone = await Phone.findOne({ deviceId: incomingDeviceId });
         if (!phone) {
           ws.send(JSON.stringify({ type: 'AUTH_FAILED', error: 'Unknown deviceId' }));
           ws.close();
           return;
         }
+
         authenticated = true;
         deviceId = incomingDeviceId;
         webSocketManager.addConnection(deviceId, ws);
         ws.send(JSON.stringify({ type: 'AUTHENTICATED' }));
         return;
       }
+
       if (!authenticated) {
         ws.send(JSON.stringify({ type: 'ERROR', error: 'Not authenticated' }));
         return;
       }
+
       switch (message.type) {
         case 'HEARTBEAT':
           await Phone.findOneAndUpdate({ deviceId }, { lastSeen: new Date() });
           ws.send(JSON.stringify({ type: 'HEARTBEAT_ACK' }));
           break;
+
         case 'STORE_RESPONSE':
         case 'RETRIEVE_RESPONSE':
           webSocketManager.handleResponse(deviceId, message);
           break;
+
         default:
           console.log('Unknown message type:', message.type);
       }

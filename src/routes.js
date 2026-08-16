@@ -16,7 +16,9 @@ const requireApiKey = (req, res, next) => {
 router.post('/add/phone', requireApiKey, async (req, res) => {
   try {
     const { deviceId } = req.body;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId is required' });
+    if (!deviceId || typeof deviceId !== 'string' || deviceId.trim() === '') {
+      return res.status(400).json({ error: 'deviceId is required and must be a non‑empty string' });
+    }
 
     const phone = await Phone.findOneAndUpdate(
       { deviceId },
@@ -47,16 +49,9 @@ router.post('/api/store', requireApiKey, async (req, res) => {
     const docId = await storageService.storeData(jsonData);
     const latencyMs = Date.now() - start;
 
-    res.status(201).json({
-      success: true,
-      docId,
-      latencyMs
-    });
+    res.status(201).json({ success: true, docId, latencyMs });
   } catch (err) {
-    res.status(500).json({
-      error: err.message,
-      latencyMs: Date.now() - start
-    });
+    res.status(500).json({ error: err.message, latencyMs: Date.now() - start });
   }
 });
 
@@ -68,16 +63,9 @@ router.get('/api/retrieve/:docId', requireApiKey, async (req, res) => {
     const data = await storageService.retrieveData(docId);
     const latencyMs = Date.now() - start;
 
-    res.json({
-      success: true,
-      data,
-      latencyMs
-    });
+    res.json({ success: true, data, latencyMs });
   } catch (err) {
-    res.status(404).json({
-      error: err.message,
-      latencyMs: Date.now() - start
-    });
+    res.status(404).json({ error: err.message, latencyMs: Date.now() - start });
   }
 });
 
