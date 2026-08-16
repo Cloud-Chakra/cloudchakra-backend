@@ -11,9 +11,7 @@ const phoneSchema = new mongoose.Schema({
 const documentSchema = new mongoose.Schema({
   docId: { type: String, unique: true, default: uuidv4, index: true },
   createdAt: { type: Date, default: Date.now },
-  mainDeviceId: { type: String, required: true },
-  backupDevicesIds: { type: [{ type: String }], default: [] },
-  replicationStatus: { type: String, enum: ['pending', 'complete'], default: 'pending' }
+  deviceIds: { type: [{ type: String }], default: [] }   // Array of device IDs that have a copy
 });
 
 const Phone = mongoose.model('Phone', phoneSchema);
