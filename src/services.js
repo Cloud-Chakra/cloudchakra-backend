@@ -105,16 +105,24 @@ class WebSocketManager {
 
   handleResponse(deviceId, message) {
     const { requestId, success, error, data } = message;
+    console.log(`[handleResponse] From ${deviceId}, requestId: ${requestId}, success: ${success}, dataType: ${typeof data}, dataPreview:`, JSON.stringify(data)?.substring(0, 100));
+    
     const pending = this.pendingRequests.get(requestId);
 
-    if (!pending) return;
+    if (!pending) {
+      console.warn(`[WebSocketManager] Received response for unknown requestId: ${requestId}`);
+      return;
+    }
 
     clearTimeout(pending.timeoutId);
     this.pendingRequests.delete(requestId);
 
     if (success) {
-      pending.resolve(data || {});
+      // Return the full message so caller can access the data field
+      console.log(`[handleResponse] Resolving with data for requestId: ${requestId}`);
+      pending.resolve({ data });
     } else {
+      console.error(`[handleResponse] Rejecting with error: ${error}`);
       pending.reject(new Error(error || 'Unknown error'));
     }
   }
@@ -206,31 +214,41 @@ const storageService = {
     if (deviceIds.length === 0) throw new Error('No devices recorded for this document');
 
     const tryDevice = async (deviceId) => {
-      if (!webSocketManager.isOnline(deviceId)) return null;
+      if (!webSocketManager.isOnline(deviceId)) {
+        console.log(`[retrieveData] Device ${deviceId} is offline, skipping`);
+        return null;
+      }
       try {
+        console.log(`[retrieveData] Attempting to retrieve doc ${docId} from device ${deviceId}`);
         const result = await webSocketManager.sendRequest(deviceId, 'RETRIEVE_DOC', { docId });
+        console.log(`[retrieveData] Received result from ${deviceId}:`, JSON.stringify(result).substring(0, 200));
         const data = result.data;
         
         // Handle both string and object responses from mobile
         if (data === null || data === undefined || data === 'undefined') {
+          console.warn(`[retrieveData] Data is null/undefined from ${deviceId}`);
           return null;
         }
         
         // If data is already an object, return it directly
         if (typeof data === 'object') {
+          console.log(`[retrieveData] Returning object data from ${deviceId}, keys:`, Object.keys(data));
           return data;
         }
         
         // If data is a string, parse it
         if (typeof data === 'string' && data.length > 0) {
           try {
-            return JSON.parse(data);
+            const parsed = JSON.parse(data);
+            console.log(`[retrieveData] Successfully parsed string data from ${deviceId}`);
+            return parsed;
           } catch (parseErr) {
             console.warn(`Failed to parse data from device ${deviceId}: ${parseErr.message}`);
             return null;
           }
         }
         
+        console.warn(`[retrieveData] Unexpected data type from ${deviceId}: ${typeof data}`);
         return null;
       } catch (err) {
         console.warn(`Failed to retrieve from device ${deviceId}: ${err.message}`);
