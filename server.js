@@ -44,14 +44,12 @@ wss.on('connection', (ws, req) => {
       if (!authenticated && message.type === 'AUTHENTICATE') {
         const { token, deviceId: incomingDeviceId } = message;
 
-        // Validate token
         if (token !== config.phoneToken) {
           ws.send(JSON.stringify({ type: 'AUTH_FAILED', error: 'Invalid token' }));
           ws.close();
           return;
         }
 
-        // Validate deviceId
         if (!incomingDeviceId || typeof incomingDeviceId !== 'string' || incomingDeviceId.trim() === '') {
           ws.send(JSON.stringify({ type: 'AUTH_FAILED', error: 'Invalid deviceId' }));
           ws.close();
@@ -98,7 +96,8 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     if (deviceId) {
-      webSocketManager.removeConnection(deviceId);
+      // Pass the ws object to ensure we only remove if it's the current connection
+      webSocketManager.removeConnection(deviceId, ws);
       storageService.handlePhoneOffline(deviceId).catch(console.error);
     }
   });

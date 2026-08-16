@@ -10,7 +10,8 @@ const config = {
   apiKey: API_KEY,
   phoneToken: PHONE_TOKEN,
   heartbeatTimeout: 60 * 1000,
-  maxDataSize: 15 * 1024 * 1024
+  maxDataSize: 15 * 1024 * 1024, // 15 MB per document
+  requestTimeout: 15000 // WebSocket request timeout in ms (15s)
 };
 
 module.exports = config;

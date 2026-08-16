@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const WebSocket = require('ws');
+const { v4: uuidv4 } = require('uuid');
 const { Phone, Document } = require('./models');
 const config = require('./config');
 
@@ -27,21 +28,28 @@ function createShards(jsonStr) {
   };
 }
 
-function reconstructBuffer(shardA, shardB, shardIndexes) {
+function reconstructBuffer(shardA, shardB, indexA, indexB) {
   const halfLen = shardA.length;
+  const shards = { [indexA]: shardA, [indexB]: shardB };
+  const sortedIndexes = [indexA, indexB].sort((a, b) => a - b);
+
   let dataShard1, dataShard2;
 
-  if (shardIndexes.includes(0) && shardIndexes.includes(1)) {
-    dataShard1 = shardA;
-    dataShard2 = shardB;
-  } else if (shardIndexes.includes(0) && shardIndexes.includes(2)) {
-    dataShard1 = shardA;
+  if (sortedIndexes[0] === 0 && sortedIndexes[1] === 1) {
+    dataShard1 = shards[0];
+    dataShard2 = shards[1];
+  } else if (sortedIndexes[0] === 0 && sortedIndexes[1] === 2) {
+    dataShard1 = shards[0];
     dataShard2 = Buffer.alloc(halfLen);
-    for (let i = 0; i < halfLen; i++) dataShard2[i] = shardA[i] ^ shardB[i];
-  } else if (shardIndexes.includes(1) && shardIndexes.includes(2)) {
-    dataShard2 = shardA;
+    for (let i = 0; i < halfLen; i++) {
+      dataShard2[i] = shards[0][i] ^ shards[2][i];
+    }
+  } else if (sortedIndexes[0] === 1 && sortedIndexes[1] === 2) {
     dataShard1 = Buffer.alloc(halfLen);
-    for (let i = 0; i < halfLen; i++) dataShard1[i] = shardA[i] ^ shardB[i];
+    dataShard2 = shards[1];
+    for (let i = 0; i < halfLen; i++) {
+      dataShard1[i] = shards[1][i] ^ shards[2][i];
+    }
   } else {
     throw new Error('Invalid shard combination');
   }
@@ -58,17 +66,20 @@ class WebSocketManager {
   }
 
   addConnection(deviceId, ws) {
-    // Validate deviceId before storing
     if (!deviceId || typeof deviceId !== 'string' || deviceId.trim() === '') {
-      console.error('Attempted to add connection with invalid deviceId:', deviceId);
+      console.error('[WebSocketManager] Rejecting connection with invalid deviceId:', deviceId);
       return;
     }
 
     if (this.connections.has(deviceId)) {
-      this.connections.get(deviceId).terminate();
+      const current = this.connections.get(deviceId);
+      if (current === ws) return; // already tracked
+      console.log('[WebSocketManager] Replacing existing connection for', deviceId);
+      current.terminate(); // will trigger close on old ws, but we ignore it later
     }
 
     this.connections.set(deviceId, ws);
+    console.log('[WebSocketManager] Connection added. Online count:', this.getOnlinePhones().length);
 
     Phone.findOneAndUpdate(
       { deviceId },
@@ -77,10 +88,18 @@ class WebSocketManager {
     ).catch(err => console.error('Error updating phone status:', err));
   }
 
-  removeConnection(deviceId) {
+  removeConnection(deviceId, ws) {
     if (!deviceId || typeof deviceId !== 'string') return;
 
+    const current = this.connections.get(deviceId);
+    if (current && current !== ws) {
+      // A newer connection has replaced this one; do not remove
+      console.log(`[WebSocketManager] Ignoring close of old connection for ${deviceId}`);
+      return;
+    }
+
     this.connections.delete(deviceId);
+    console.log('[WebSocketManager] Connection removed. Online count:', this.getOnlinePhones().length);
 
     Phone.findOneAndUpdate(
       { deviceId },
@@ -99,12 +118,15 @@ class WebSocketManager {
     for (const [deviceId, ws] of this.connections.entries()) {
       if (deviceId && typeof deviceId === 'string' && deviceId.trim() !== '' && ws.readyState === WebSocket.OPEN) {
         online.push(deviceId);
+      } else {
+        console.warn('[WebSocketManager] Skipping invalid/offline connection:', deviceId, ws?.readyState);
       }
     }
+    console.log('[WebSocketManager] Online phones list:', online);
     return online;
   }
 
-  sendRequest(deviceId, type, payload, timeout = 15000) {
+  sendRequest(deviceId, type, payload, timeout = config.requestTimeout || 15000) {
     return new Promise((resolve, reject) => {
       if (!deviceId || typeof deviceId !== 'string' || deviceId.trim() === '') {
         return reject(new Error('Device ID is missing or invalid'));
@@ -123,7 +145,7 @@ class WebSocketManager {
         reject(new Error(`Timeout waiting for response from ${deviceId}`));
       }, timeout);
 
-      this.pendingRequests.set(requestId, { resolve, reject, type });
+      this.pendingRequests.set(requestId, { resolve, reject, type, timeoutId });
       ws.send(JSON.stringify(message));
     });
   }
@@ -134,6 +156,7 @@ class WebSocketManager {
 
     if (!pending) return;
 
+    clearTimeout(pending.timeoutId);
     this.pendingRequests.delete(requestId);
 
     if (success) {
@@ -143,7 +166,7 @@ class WebSocketManager {
     }
   }
 
-  startHeartbeat(interval = 60000) {
+  startHeartbeat(interval = 30000) {
     if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
 
     this.heartbeatInterval = setInterval(async () => {
@@ -152,7 +175,6 @@ class WebSocketManager {
       }
 
       const allPhones = await Phone.find({ status: 'online' });
-
       for (const phone of allPhones) {
         if (!this.isOnline(phone.deviceId)) {
           phone.status = 'offline';
@@ -169,37 +191,55 @@ const storageService = {
   async storeData(jsonObj) {
     const jsonStr = JSON.stringify(jsonObj);
     const { shards } = createShards(jsonStr);
+    const docId = uuidv4(); // generate upfront, used in all shards
 
-    const onlinePhones = webSocketManager.getOnlinePhones();
-
-    if (onlinePhones.length < 3) {
-      throw new Error(`Need at least 3 online phones, currently ${onlinePhones.length}`);
+    let onlinePhones = webSocketManager.getOnlinePhones().filter(id => typeof id === 'string' && id.trim() !== '');
+    if (onlinePhones.length === 0) {
+      throw new Error('No online phones available to store data');
     }
 
-    // Shuffle and pick three distinct phones
-    const shuffled = [...onlinePhones].sort(() => Math.random() - 0.5);
-    const selectedPhones = shuffled.slice(0, 3);
+    // Build assignment plan: array of { shardIndex, deviceId }
+    const assignments = [];
+
+    if (onlinePhones.length === 1) {
+      const phone = onlinePhones[0];
+      for (let i = 0; i < 3; i++) {
+        assignments.push({ shardIndex: i, deviceId: phone });
+      }
+    } else if (onlinePhones.length === 2) {
+      // Two phones: each phone gets two shards for redundancy
+      const phone0 = onlinePhones[0];
+      const phone1 = onlinePhones[1];
+      // phone0: shard0 & shard1, phone1: shard0 & shard2
+      assignments.push({ shardIndex: 0, deviceId: phone0 });
+      assignments.push({ shardIndex: 1, deviceId: phone0 });
+      assignments.push({ shardIndex: 0, deviceId: phone1 });
+      assignments.push({ shardIndex: 2, deviceId: phone1 });
+    } else {
+      // Three or more phones: use distinct phones for each shard
+      const selected = onlinePhones.slice(0, 3);
+      for (let i = 0; i < 3; i++) {
+        assignments.push({ shardIndex: i, deviceId: selected[i] });
+      }
+    }
 
     const shardResults = [];
 
-    await Promise.all(shards.map(async (shard, index) => {
-      const deviceId = selectedPhones[index];
-      if (!deviceId) {
-        throw new Error('Selected phone has invalid deviceId');
-      }
-
+    await Promise.all(assignments.map(async (assignment) => {
+      const { shardIndex, deviceId } = assignment;
+      const shard = shards[shardIndex];
       const shardId = crypto.randomBytes(8).toString('hex');
       const payload = {
-        shardIndex: index,
+        shardIndex,
         data: shard.toString('base64'),
-        docId: null,
+        docId,
         shardId
       };
 
       await webSocketManager.sendRequest(deviceId, 'STORE_SHARD', payload);
 
       shardResults.push({
-        shardIndex: index,
+        shardIndex,
         deviceId,
         shardId,
         size: shard.length,
@@ -208,10 +248,10 @@ const storageService = {
     }));
 
     const doc = new Document({
+      docId,
       originalSize: Buffer.byteLength(jsonStr, 'utf8'),
       shards: shardResults
     });
-
     await doc.save();
     return doc.docId;
   },
@@ -221,18 +261,19 @@ const storageService = {
     if (!doc) throw new Error('Document not found');
 
     const onlineShards = doc.shards.filter(s => webSocketManager.isOnline(s.deviceId));
-    if (onlineShards.length < 2) throw new Error('Not enough shards online to reconstruct');
-
-    // Choose any two shards (prefer both data shards for simplicity)
-    const chosenShards = [];
-    const dataShards = onlineShards.filter(s => s.shardIndex !== 2);
-
-    if (dataShards.length >= 2) {
-      chosenShards.push(dataShards[0], dataShards[1]);
-    } else {
-      chosenShards.push(onlineShards.find(s => s.shardIndex !== 2));
-      chosenShards.push(onlineShards.find(s => s.shardIndex === 2));
+    if (onlineShards.length === 0) {
+      throw new Error('No shards online for this document');
     }
+
+    // Get unique shard indexes that are online
+    const availableIndexes = [...new Set(onlineShards.map(s => s.shardIndex))];
+    if (availableIndexes.length < 2) {
+      throw new Error('Not enough distinct shards online to reconstruct');
+    }
+
+    // Choose any two distinct indexes (first two in list)
+    const chosenIndexes = [availableIndexes[0], availableIndexes[1]];
+    const chosenShards = chosenIndexes.map(idx => onlineShards.find(s => s.shardIndex === idx));
 
     const shardDataPromises = chosenShards.map(async (shardInfo) => {
       const result = await webSocketManager.sendRequest(
@@ -244,12 +285,10 @@ const storageService = {
     });
 
     const retrieved = await Promise.all(shardDataPromises);
-
     const shardBuffers = retrieved.map(r => Buffer.from(r.data, 'base64'));
     const indexes = retrieved.map(r => r.index);
-    const reconstructedBuffer = reconstructBuffer(shardBuffers[0], shardBuffers[1], indexes);
+    const reconstructedBuffer = reconstructBuffer(shardBuffers[0], shardBuffers[1], indexes[0], indexes[1]);
 
-    // Remove any padding null bytes before parsing
     const jsonStr = reconstructedBuffer.toString('utf8').replace(/\0+$/, '');
     return JSON.parse(jsonStr);
   },
@@ -258,72 +297,129 @@ const storageService = {
     if (!deviceId || typeof deviceId !== 'string') return;
 
     const docs = await Document.find({ 'shards.deviceId': deviceId });
+    if (docs.length === 0) return;
+
+    const onlinePhones = webSocketManager.getOnlinePhones()
+      .filter(id => id !== deviceId && typeof id === 'string' && id.trim() !== '');
 
     for (const doc of docs) {
-      const lostShard = doc.shards.find(s => s.deviceId === deviceId);
-      if (!lostShard) continue;
-
-      const otherShards = doc.shards.filter(s => s.deviceId !== deviceId);
-      const onlineOther = otherShards.filter(s => webSocketManager.isOnline(s.deviceId));
-
-      if (onlineOther.length < 2) continue;
-
-      const onlinePhones = webSocketManager.getOnlinePhones();
-      const candidates = onlinePhones.filter(d => d !== deviceId && !doc.shards.some(s => s.deviceId === d));
-
-      if (candidates.length === 0) continue;
-
-      const newPhone = candidates[0];
-
-      // Fetch the two remaining shards from other phones
-      const shardFetchPromises = onlineOther.map(shardInfo =>
-        webSocketManager.sendRequest(shardInfo.deviceId, 'RETRIEVE_SHARD', { shardId: shardInfo.shardId })
-      );
-      const fetched = await Promise.all(shardFetchPromises);
-
-      const otherShardData = fetched.map(f => Buffer.from(f.data, 'base64'));
-      const otherIndexes = onlineOther.map(s => s.shardIndex);
-
-      let missingShardBuffer;
-
-      if (lostShard.shardIndex === 2) {
-        const data0 = otherShardData[otherIndexes.indexOf(0)];
-        const data1 = otherShardData[otherIndexes.indexOf(1)];
-        missingShardBuffer = Buffer.alloc(data0.length);
-        for (let i = 0; i < data0.length; i++) missingShardBuffer[i] = data0[i] ^ data1[i];
-      } else if (lostShard.shardIndex === 0) {
-        const parity = otherShardData[otherIndexes.indexOf(2)];
-        const data1 = otherShardData[otherIndexes.indexOf(1)];
-        missingShardBuffer = Buffer.alloc(parity.length);
-        for (let i = 0; i < parity.length; i++) missingShardBuffer[i] = parity[i] ^ data1[i];
-      } else {
-        const parity = otherShardData[otherIndexes.indexOf(2)];
-        const data0 = otherShardData[otherIndexes.indexOf(0)];
-        missingShardBuffer = Buffer.alloc(parity.length);
-        for (let i = 0; i < parity.length; i++) missingShardBuffer[i] = parity[i] ^ data0[i];
+      // Determine which shard indexes are now missing online copies
+      const missingIndexes = [];
+      for (let idx = 0; idx < 3; idx++) {
+        const hasOnlineCopy = doc.shards.some(
+          s => s.shardIndex === idx && s.deviceId !== deviceId && webSocketManager.isOnline(s.deviceId)
+        );
+        if (!hasOnlineCopy) {
+          missingIndexes.push(idx);
+        }
       }
 
-      const newShardId = crypto.randomBytes(8).toString('hex');
+      if (missingIndexes.length === 0) continue;
 
-      await webSocketManager.sendRequest(newPhone, 'STORE_SHARD', {
-        shardIndex: lostShard.shardIndex,
-        data: missingShardBuffer.toString('base64'),
-        docId: doc.docId,
-        shardId: newShardId
-      });
+      for (const missingIdx of missingIndexes) {
+        // We need the other two shard indexes to reconstruct
+        const otherIndexes = [0, 1, 2].filter(i => i !== missingIdx);
+        const copiesForOther = otherIndexes.map(idx =>
+          doc.shards.find(s =>
+            s.shardIndex === idx &&
+            s.deviceId !== deviceId &&
+            webSocketManager.isOnline(s.deviceId)
+          )
+        );
 
-      await Document.findOneAndUpdate(
-        { docId: doc.docId, 'shards.shardIndex': lostShard.shardIndex },
-        {
-          $set: {
-            'shards.$.deviceId': newPhone,
-            'shards.$.shardId': newShardId,
-            'shards.$.storedAt': new Date()
+        if (copiesForOther.some(c => !c)) {
+          console.warn(`Cannot reconstruct shard ${missingIdx} for doc ${doc.docId}: missing other shards online`);
+          continue;
+        }
+
+        // Fetch the two other shards
+        const fetched = await Promise.all(copiesForOther.map(async (shardInfo) => {
+          const result = await webSocketManager.sendRequest(
+            shardInfo.deviceId,
+            'RETRIEVE_SHARD',
+            { shardId: shardInfo.shardId }
+          );
+          return { index: shardInfo.shardIndex, data: Buffer.from(result.data, 'base64') };
+        }));
+
+        const [shardA, shardB] = fetched;
+        const indexA = shardA.index;
+        const indexB = shardB.index;
+
+        let missingBuffer;
+        if (missingIdx === 0) {
+          // shard0 = shard1 XOR shard2
+          if ((indexA === 1 && indexB === 2) || (indexA === 2 && indexB === 1)) {
+            missingBuffer = Buffer.alloc(shardA.data.length);
+            for (let i = 0; i < shardA.data.length; i++) {
+              missingBuffer[i] = shardA.data[i] ^ shardB.data[i];
+            }
+          } else {
+            console.error('Wrong shards to reconstruct shard0');
+            continue;
+          }
+        } else if (missingIdx === 1) {
+          // shard1 = shard0 XOR shard2
+          if ((indexA === 0 && indexB === 2) || (indexA === 2 && indexB === 0)) {
+            missingBuffer = Buffer.alloc(shardA.data.length);
+            for (let i = 0; i < shardA.data.length; i++) {
+              missingBuffer[i] = shardA.data[i] ^ shardB.data[i];
+            }
+          } else {
+            console.error('Wrong shards to reconstruct shard1');
+            continue;
+          }
+        } else { // missingIdx === 2
+          // parity = shard0 XOR shard1
+          if ((indexA === 0 && indexB === 1) || (indexA === 1 && indexB === 0)) {
+            missingBuffer = Buffer.alloc(shardA.data.length);
+            for (let i = 0; i < shardA.data.length; i++) {
+              missingBuffer[i] = shardA.data[i] ^ shardB.data[i];
+            }
+          } else {
+            console.error('Wrong shards to reconstruct shard2');
+            continue;
           }
         }
-      );
 
-      console.log(`Re‑replicated shard ${lostShard.shardIndex} to ${newPhone}`);
+        // Choose a new phone for the reconstructed shard
+        const existingDevicesForIndex = doc.shards
+          .filter(s => s.shardIndex === missingIdx)
+          .map(s => s.deviceId);
+        const candidates = onlinePhones.filter(p => !existingDevicesForIndex.includes(p));
+        const newPhone = candidates.length > 0 ? candidates[0] : onlinePhones[0];
+
+        if (!newPhone) {
+          console.warn('No online phone to store reconstructed shard');
+          continue;
+        }
+
+        const newShardId = crypto.randomBytes(8).toString('hex');
+        await webSocketManager.sendRequest(newPhone, 'STORE_SHARD', {
+          shardIndex: missingIdx,
+          data: missingBuffer.toString('base64'),
+          docId: doc.docId,
+          shardId: newShardId
+        });
+
+        // Add new entry to document
+        await Document.updateOne(
+          { docId: doc.docId },
+          {
+            $push: {
+              shards: {
+                shardIndex: missingIdx,
+                deviceId: newPhone,
+                shardId: newShardId,
+                size: missingBuffer.length,
+                storedAt: new Date()
+              }
+            }
+          }
+        );
+
+        console.log(`Re-replicated shard ${missingIdx} of doc ${doc.docId} to ${newPhone}`);
+      }
     }
   }
 };
