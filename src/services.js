@@ -4,65 +4,13 @@ const { v4: uuidv4 } = require('uuid');
 const { Phone, Document } = require('./models');
 const config = require('./config');
 
-// ---------- XOR Erasure Coding (no encryption) ----------
-function createShards(jsonStr) {
-  let buf = Buffer.from(jsonStr, 'utf8');
-  let padding = 0;
-  if (buf.length % 2 !== 0) {
-    padding = 1;
-    buf = Buffer.concat([buf, Buffer.alloc(1)]);
-  }
-
-  const half = buf.length / 2;
-  const shard1 = buf.subarray(0, half);
-  const shard2 = buf.subarray(half);
-  const parity = Buffer.alloc(half);
-
-  for (let i = 0; i < half; i++) {
-    parity[i] = shard1[i] ^ shard2[i];
-  }
-
-  return {
-    shards: [shard1, shard2, parity],
-    paddingLength: padding
-  };
-}
-
-function reconstructBuffer(shardA, shardB, indexA, indexB) {
-  const halfLen = shardA.length;
-  const shards = { [indexA]: shardA, [indexB]: shardB };
-  const sortedIndexes = [indexA, indexB].sort((a, b) => a - b);
-
-  let dataShard1, dataShard2;
-
-  if (sortedIndexes[0] === 0 && sortedIndexes[1] === 1) {
-    dataShard1 = shards[0];
-    dataShard2 = shards[1];
-  } else if (sortedIndexes[0] === 0 && sortedIndexes[1] === 2) {
-    dataShard1 = shards[0];
-    dataShard2 = Buffer.alloc(halfLen);
-    for (let i = 0; i < halfLen; i++) {
-      dataShard2[i] = shards[0][i] ^ shards[2][i];
-    }
-  } else if (sortedIndexes[0] === 1 && sortedIndexes[1] === 2) {
-    dataShard1 = Buffer.alloc(halfLen);
-    dataShard2 = shards[1];
-    for (let i = 0; i < halfLen; i++) {
-      dataShard1[i] = shards[1][i] ^ shards[2][i];
-    }
-  } else {
-    throw new Error('Invalid shard combination');
-  }
-
-  return Buffer.concat([dataShard1, dataShard2]);
-}
-
 // ---------- WebSocket Manager ----------
 class WebSocketManager {
   constructor() {
     this.connections = new Map();
     this.pendingRequests = new Map();
     this.heartbeatInterval = null;
+    this.replicationInterval = null;
   }
 
   addConnection(deviceId, ws) {
@@ -73,9 +21,9 @@ class WebSocketManager {
 
     if (this.connections.has(deviceId)) {
       const current = this.connections.get(deviceId);
-      if (current === ws) return; // already tracked
+      if (current === ws) return;
       console.log('[WebSocketManager] Replacing existing connection for', deviceId);
-      current.terminate(); // will trigger close on old ws, but we ignore it later
+      current.terminate();
     }
 
     this.connections.set(deviceId, ws);
@@ -86,6 +34,11 @@ class WebSocketManager {
       { status: 'online', lastSeen: new Date() },
       { upsert: true }
     ).catch(err => console.error('Error updating phone status:', err));
+
+    // Trigger replication check for docs that might need this new device
+    storageService.handlePhoneOnline(deviceId).catch(err =>
+      console.error(`Error handling phone online for ${deviceId}:`, err)
+    );
   }
 
   removeConnection(deviceId, ws) {
@@ -93,7 +46,6 @@ class WebSocketManager {
 
     const current = this.connections.get(deviceId);
     if (current && current !== ws) {
-      // A newer connection has replaced this one; do not remove
       console.log(`[WebSocketManager] Ignoring close of old connection for ${deviceId}`);
       return;
     }
@@ -105,6 +57,11 @@ class WebSocketManager {
       { deviceId },
       { status: 'offline' }
     ).catch(err => console.error('Error updating phone status:', err));
+
+    // Immediately try to replicate docs that were on this device
+    storageService.handlePhoneOffline(deviceId).catch(err =>
+      console.error(`Error handling phone offline for ${deviceId}:`, err)
+    );
   }
 
   isOnline(deviceId) {
@@ -122,7 +79,6 @@ class WebSocketManager {
         console.warn('[WebSocketManager] Skipping invalid/offline connection:', deviceId, ws?.readyState);
       }
     }
-    console.log('[WebSocketManager] Online phones list:', online);
     return online;
   }
 
@@ -174,8 +130,10 @@ class WebSocketManager {
         if (ws.readyState === WebSocket.OPEN) ws.ping();
       }
 
-      const allPhones = await Phone.find({ status: 'online' });
-      for (const phone of allPhones) {
+      // Use in-memory connection map to reconcile DB statuses
+      // Only devices that are in DB but not in memory are considered offline
+      const onlineInDb = await Phone.find({ status: 'online' });
+      for (const phone of onlineInDb) {
         if (!this.isOnline(phone.deviceId)) {
           phone.status = 'offline';
           await phone.save();
@@ -184,248 +142,248 @@ class WebSocketManager {
       }
     }, interval);
   }
+
+  startReplicationSweep(interval = 60000) {
+    if (this.replicationInterval) clearInterval(this.replicationInterval);
+
+    this.replicationInterval = setInterval(async () => {
+      try {
+        await storageService.replicationSweep();
+      } catch (err) {
+        console.error('Replication sweep error:', err);
+      }
+    }, interval);
+  }
 }
 
-// ---------- Storage Service ----------
+// ---------- Global lock to prevent concurrent replication of the same doc ----------
+const replicatingDocs = new Set();
+
+// ---------- Storage Service (Replication-based) ----------
 const storageService = {
   async storeData(jsonObj) {
     const jsonStr = JSON.stringify(jsonObj);
-    const { shards } = createShards(jsonStr);
-    const docId = uuidv4(); // generate upfront, used in all shards
+    const docId = uuidv4();
 
-    let onlinePhones = webSocketManager.getOnlinePhones().filter(id => typeof id === 'string' && id.trim() !== '');
+    const onlinePhones = webSocketManager.getOnlinePhones();
     if (onlinePhones.length === 0) {
       throw new Error('No online phones available to store data');
     }
 
-    // Build assignment plan: array of { shardIndex, deviceId }
-    const assignments = [];
+    const mainDeviceId = onlinePhones[0];
 
-    if (onlinePhones.length === 1) {
-      const phone = onlinePhones[0];
-      for (let i = 0; i < 3; i++) {
-        assignments.push({ shardIndex: i, deviceId: phone });
-      }
-    } else if (onlinePhones.length === 2) {
-      // Two phones: each phone gets two shards for redundancy
-      const phone0 = onlinePhones[0];
-      const phone1 = onlinePhones[1];
-      // phone0: shard0 & shard1, phone1: shard0 & shard2
-      assignments.push({ shardIndex: 0, deviceId: phone0 });
-      assignments.push({ shardIndex: 1, deviceId: phone0 });
-      assignments.push({ shardIndex: 0, deviceId: phone1 });
-      assignments.push({ shardIndex: 2, deviceId: phone1 });
-    } else {
-      // Three or more phones: use distinct phones for each shard
-      const selected = onlinePhones.slice(0, 3);
-      for (let i = 0; i < 3; i++) {
-        assignments.push({ shardIndex: i, deviceId: selected[i] });
-      }
-    }
-
-    const shardResults = [];
-
-    await Promise.all(assignments.map(async (assignment) => {
-      const { shardIndex, deviceId } = assignment;
-      const shard = shards[shardIndex];
-      const shardId = crypto.randomBytes(8).toString('hex');
-      const payload = {
-        shardIndex,
-        data: shard.toString('base64'),
-        docId,
-        shardId
-      };
-
-      await webSocketManager.sendRequest(deviceId, 'STORE_SHARD', payload);
-
-      shardResults.push({
-        shardIndex,
-        deviceId,
-        shardId,
-        size: shard.length,
-        storedAt: new Date()
-      });
-    }));
+    // Store on main device synchronously (raw JSON string, no base64)
+    await webSocketManager.sendRequest(mainDeviceId, 'STORE_DOC', {
+      docId,
+      data: jsonStr
+    });
 
     const doc = new Document({
       docId,
-      originalSize: Buffer.byteLength(jsonStr, 'utf8'),
-      shards: shardResults
+      mainDeviceId,
+      backupDevicesIds: [],
+      replicationStatus: 'pending'
     });
     await doc.save();
-    return doc.docId;
+
+    // Asynchronously replicate to backups
+    setImmediate(() => {
+      storageService.ensureReplication(doc).catch(err => {
+        console.error(`Initial replication for doc ${docId} failed:`, err);
+      });
+    });
+
+    return docId;
   },
 
   async retrieveData(docId) {
     const doc = await Document.findOne({ docId });
     if (!doc) throw new Error('Document not found');
 
-    const onlineShards = doc.shards.filter(s => webSocketManager.isOnline(s.deviceId));
-    if (onlineShards.length === 0) {
-      throw new Error('No shards online for this document');
+    // Try main device first
+    if (webSocketManager.isOnline(doc.mainDeviceId)) {
+      try {
+        const result = await webSocketManager.sendRequest(doc.mainDeviceId, 'RETRIEVE_DOC', { docId });
+        return JSON.parse(result.data);  // result.data is a JSON string
+      } catch (err) {
+        console.warn(`Failed to retrieve from main device ${doc.mainDeviceId}: ${err.message}`);
+      }
     }
 
-    // Get unique shard indexes that are online
-    const availableIndexes = [...new Set(onlineShards.map(s => s.shardIndex))];
-    if (availableIndexes.length < 2) {
-      throw new Error('Not enough distinct shards online to reconstruct');
+    // Try backup devices in order
+    for (const deviceId of doc.backupDevicesIds) {
+      if (webSocketManager.isOnline(deviceId)) {
+        try {
+          const result = await webSocketManager.sendRequest(deviceId, 'RETRIEVE_DOC', { docId });
+          return JSON.parse(result.data);  // plain JSON string
+        } catch (err) {
+          console.warn(`Failed to retrieve from backup device ${deviceId}: ${err.message}`);
+        }
+      }
     }
 
-    // Choose any two distinct indexes (first two in list)
-    const chosenIndexes = [availableIndexes[0], availableIndexes[1]];
-    const chosenShards = chosenIndexes.map(idx => onlineShards.find(s => s.shardIndex === idx));
-
-    const shardDataPromises = chosenShards.map(async (shardInfo) => {
-      const result = await webSocketManager.sendRequest(
-        shardInfo.deviceId,
-        'RETRIEVE_SHARD',
-        { shardId: shardInfo.shardId }
-      );
-      return { index: shardInfo.shardIndex, data: result.data };
-    });
-
-    const retrieved = await Promise.all(shardDataPromises);
-    const shardBuffers = retrieved.map(r => Buffer.from(r.data, 'base64'));
-    const indexes = retrieved.map(r => r.index);
-    const reconstructedBuffer = reconstructBuffer(shardBuffers[0], shardBuffers[1], indexes[0], indexes[1]);
-
-    const jsonStr = reconstructedBuffer.toString('utf8').replace(/\0+$/, '');
-    return JSON.parse(jsonStr);
+    throw new Error('No online copy available for this document');
   },
 
   async handlePhoneOffline(deviceId) {
-    if (!deviceId || typeof deviceId !== 'string') return;
+    const docs = await Document.find({
+      $or: [
+        { mainDeviceId: deviceId },
+        { backupDevicesIds: { $in: [deviceId] } }
+      ]
+    });
 
-    const docs = await Document.find({ 'shards.deviceId': deviceId });
-    if (docs.length === 0) return;
+    // Process in parallel with concurrency limit to avoid overwhelming event loop
+    const concurrency = 5;
+    for (let i = 0; i < docs.length; i += concurrency) {
+      const batch = docs.slice(i, i + concurrency);
+      await Promise.all(batch.map(doc => storageService.ensureReplication(doc)));
+    }
+  },
 
-    const onlinePhones = webSocketManager.getOnlinePhones()
-      .filter(id => id !== deviceId && typeof id === 'string' && id.trim() !== '');
+  async handlePhoneOnline(deviceId) {
+    // Find docs that have fewer than 3 copies and do not already include this device.
+    // Also include docs where main is offline and this device could become main.
+    const docs = await Document.find({
+      $expr: {
+        $lt: [{ $size: '$backupDevicesIds' }, 2]
+      },
+      mainDeviceId: { $ne: deviceId },
+      backupDevicesIds: { $nin: [deviceId] }
+    });
 
-    for (const doc of docs) {
-      // Determine which shard indexes are now missing online copies
-      const missingIndexes = [];
-      for (let idx = 0; idx < 3; idx++) {
-        const hasOnlineCopy = doc.shards.some(
-          s => s.shardIndex === idx && s.deviceId !== deviceId && webSocketManager.isOnline(s.deviceId)
-        );
-        if (!hasOnlineCopy) {
-          missingIndexes.push(idx);
+    const concurrency = 5;
+    for (let i = 0; i < docs.length; i += concurrency) {
+      const batch = docs.slice(i, i + concurrency);
+      await Promise.all(batch.map(doc => storageService.ensureReplication(doc)));
+    }
+  },
+
+  /**
+   * Ensure a document has at least 3 online copies.
+   * - Promotes a backup to main if main is offline.
+   * - Prunes offline backups from backupDevicesIds.
+   * - Replicates to new devices if needed.
+   */
+  async ensureReplication(doc) {
+    // Prevent concurrent replication for the same doc
+    if (replicatingDocs.has(doc.docId)) {
+      console.log(`Replication already in progress for doc ${doc.docId}, skipping.`);
+      return;
+    }
+    replicatingDocs.add(doc.docId);
+
+    try {
+      // 1. Remove offline backups from backupDevicesIds
+      const onlineBackups = doc.backupDevicesIds.filter(id => webSocketManager.isOnline(id));
+      if (onlineBackups.length !== doc.backupDevicesIds.length) {
+        doc.backupDevicesIds = onlineBackups;
+      }
+
+      // 2. If main is offline, promote the first online backup (if any) to main
+      if (!webSocketManager.isOnline(doc.mainDeviceId) && onlineBackups.length > 0) {
+        const newMain = onlineBackups[0];
+        doc.backupDevicesIds = doc.backupDevicesIds.filter(id => id !== newMain);
+        doc.mainDeviceId = newMain;
+        console.log(`Promoted backup ${newMain} to main for doc ${doc.docId}`);
+      }
+
+      // 3. Determine current online copies after promotion/pruning
+      const allCopyDevices = [doc.mainDeviceId, ...doc.backupDevicesIds];
+      const onlineCopyDevices = allCopyDevices.filter(id => webSocketManager.isOnline(id));
+
+      // 4. If already have 3 online copies, mark complete and return
+      if (onlineCopyDevices.length >= 3) {
+        if (doc.replicationStatus !== 'complete') {
+          doc.replicationStatus = 'complete';
+          await doc.save();
+        }
+        return;
+      }
+
+      // 5. Calculate how many additional copies we need
+      const needed = 3 - onlineCopyDevices.length;
+      const onlinePhones = webSocketManager.getOnlinePhones();
+      const candidates = onlinePhones.filter(id => !allCopyDevices.includes(id));
+
+      // If no candidates, we cannot complete replication now
+      if (candidates.length === 0) {
+        console.log(`No candidates to replicate doc ${doc.docId}. Remaining pending.`);
+        await doc.save(); // persist any pruning/promotion changes
+        return;
+      }
+
+      // 6. Need source data from an existing online copy
+      if (onlineCopyDevices.length === 0) {
+        console.warn(`Cannot replicate doc ${doc.docId}: no online copy available to source data`);
+        await doc.save();
+        return;
+      }
+
+      const sourceDeviceId = onlineCopyDevices[0];
+      let dataStr;
+      try {
+        const result = await webSocketManager.sendRequest(sourceDeviceId, 'RETRIEVE_DOC', { docId: doc.docId });
+        dataStr = result.data;  // raw JSON string
+      } catch (err) {
+        console.error(`Failed to retrieve from source ${sourceDeviceId} for replication: ${err.message}`);
+        await doc.save();
+        return;
+      }
+
+      // 7. Replicate to up to `needed` new devices
+      const devicesToAdd = candidates.slice(0, needed);
+      for (const newDeviceId of devicesToAdd) {
+        try {
+          await webSocketManager.sendRequest(newDeviceId, 'STORE_DOC', {
+            docId: doc.docId,
+            data: dataStr
+          });
+          doc.backupDevicesIds.push(newDeviceId);
+          console.log(`Replicated doc ${doc.docId} to ${newDeviceId}`);
+        } catch (err) {
+          console.error(`Failed to replicate to ${newDeviceId}: ${err.message}`);
         }
       }
 
-      if (missingIndexes.length === 0) continue;
-
-      for (const missingIdx of missingIndexes) {
-        // We need the other two shard indexes to reconstruct
-        const otherIndexes = [0, 1, 2].filter(i => i !== missingIdx);
-        const copiesForOther = otherIndexes.map(idx =>
-          doc.shards.find(s =>
-            s.shardIndex === idx &&
-            s.deviceId !== deviceId &&
-            webSocketManager.isOnline(s.deviceId)
-          )
-        );
-
-        if (copiesForOther.some(c => !c)) {
-          console.warn(`Cannot reconstruct shard ${missingIdx} for doc ${doc.docId}: missing other shards online`);
-          continue;
-        }
-
-        // Fetch the two other shards
-        const fetched = await Promise.all(copiesForOther.map(async (shardInfo) => {
-          const result = await webSocketManager.sendRequest(
-            shardInfo.deviceId,
-            'RETRIEVE_SHARD',
-            { shardId: shardInfo.shardId }
-          );
-          return { index: shardInfo.shardIndex, data: Buffer.from(result.data, 'base64') };
-        }));
-
-        const [shardA, shardB] = fetched;
-        const indexA = shardA.index;
-        const indexB = shardB.index;
-
-        let missingBuffer;
-        if (missingIdx === 0) {
-          // shard0 = shard1 XOR shard2
-          if ((indexA === 1 && indexB === 2) || (indexA === 2 && indexB === 1)) {
-            missingBuffer = Buffer.alloc(shardA.data.length);
-            for (let i = 0; i < shardA.data.length; i++) {
-              missingBuffer[i] = shardA.data[i] ^ shardB.data[i];
-            }
-          } else {
-            console.error('Wrong shards to reconstruct shard0');
-            continue;
-          }
-        } else if (missingIdx === 1) {
-          // shard1 = shard0 XOR shard2
-          if ((indexA === 0 && indexB === 2) || (indexA === 2 && indexB === 0)) {
-            missingBuffer = Buffer.alloc(shardA.data.length);
-            for (let i = 0; i < shardA.data.length; i++) {
-              missingBuffer[i] = shardA.data[i] ^ shardB.data[i];
-            }
-          } else {
-            console.error('Wrong shards to reconstruct shard1');
-            continue;
-          }
-        } else { // missingIdx === 2
-          // parity = shard0 XOR shard1
-          if ((indexA === 0 && indexB === 1) || (indexA === 1 && indexB === 0)) {
-            missingBuffer = Buffer.alloc(shardA.data.length);
-            for (let i = 0; i < shardA.data.length; i++) {
-              missingBuffer[i] = shardA.data[i] ^ shardB.data[i];
-            }
-          } else {
-            console.error('Wrong shards to reconstruct shard2');
-            continue;
-          }
-        }
-
-        // Choose a new phone for the reconstructed shard
-        const existingDevicesForIndex = doc.shards
-          .filter(s => s.shardIndex === missingIdx)
-          .map(s => s.deviceId);
-        const candidates = onlinePhones.filter(p => !existingDevicesForIndex.includes(p));
-        const newPhone = candidates.length > 0 ? candidates[0] : onlinePhones[0];
-
-        if (!newPhone) {
-          console.warn('No online phone to store reconstructed shard');
-          continue;
-        }
-
-        const newShardId = crypto.randomBytes(8).toString('hex');
-        await webSocketManager.sendRequest(newPhone, 'STORE_SHARD', {
-          shardIndex: missingIdx,
-          data: missingBuffer.toString('base64'),
-          docId: doc.docId,
-          shardId: newShardId
-        });
-
-        // Add new entry to document
-        await Document.updateOne(
-          { docId: doc.docId },
-          {
-            $push: {
-              shards: {
-                shardIndex: missingIdx,
-                deviceId: newPhone,
-                shardId: newShardId,
-                size: missingBuffer.length,
-                storedAt: new Date()
-              }
-            }
-          }
-        );
-
-        console.log(`Re-replicated shard ${missingIdx} of doc ${doc.docId} to ${newPhone}`);
+      // 8. Re-evaluate online copies and update status
+      const updatedOnlineCopies = [doc.mainDeviceId, ...doc.backupDevicesIds]
+        .filter(id => webSocketManager.isOnline(id)).length;
+      if (updatedOnlineCopies >= 3) {
+        doc.replicationStatus = 'complete';
+      } else {
+        doc.replicationStatus = 'pending'; // still under-replicated
       }
+      await doc.save();
+    } finally {
+      replicatingDocs.delete(doc.docId);
+    }
+  },
+
+  /**
+   * Periodic sweep to heal under-replicated documents.
+   * Only processes documents that are marked pending or have fewer than 2 backups.
+   * This avoids scanning the entire collection unnecessarily.
+   */
+  async replicationSweep() {
+    const docs = await Document.find({
+      $or: [
+        { replicationStatus: 'pending' },
+        { $expr: { $lt: [{ $size: '$backupDevicesIds' }, 2] } }
+      ]
+    }).limit(1000); // process in batches to limit memory usage
+
+    const concurrency = 10;
+    for (let i = 0; i < docs.length; i += concurrency) {
+      const batch = docs.slice(i, i + concurrency);
+      await Promise.all(batch.map(doc => storageService.ensureReplication(doc)));
     }
   }
 };
 
-// Instantiate WebSocketManager and start heartbeat
+// Instantiate WebSocketManager and start background tasks
 const webSocketManager = new WebSocketManager();
 webSocketManager.startHeartbeat(30000);
+webSocketManager.startReplicationSweep(60000);
 
 module.exports = { webSocketManager, storageService };

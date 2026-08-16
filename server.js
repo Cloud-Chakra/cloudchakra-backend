@@ -17,15 +17,17 @@ app.use(express.json({ limit: '15mb' }));
 
 app.use('/', router);
 
-mongoose.connect(config.mongodbUri, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-.then(() => console.log('MongoDB connected'))
-.catch(err => {
-  console.error('MongoDB connection error:', err);
-  process.exit(1);
-});
+mongoose.connect(config.mongodbUri)
+  .then(async () => {
+    console.log('MongoDB connected');
+    // Reset all phone statuses to offline on server start
+    await Phone.updateMany({}, { status: 'offline' });
+    console.log('All phones marked offline');
+  })
+  .catch(err => {
+    console.error('MongoDB connection error:', err);
+    process.exit(1);
+  });
 
 const server = app.listen(config.port, () => {
   console.log(`Server running on port ${config.port}`);
@@ -96,9 +98,7 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     if (deviceId) {
-      // Pass the ws object to ensure we only remove if it's the current connection
       webSocketManager.removeConnection(deviceId, ws);
-      storageService.handlePhoneOffline(deviceId).catch(console.error);
     }
   });
 
